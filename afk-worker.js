@@ -630,10 +630,26 @@ function updateScoreboardObjective(params) {
   syncScoreboardSnapshots()
 }
 
+let scoreboardDebugDumped = false
 function updateScoreboardEntries(params) {
   const action = String(params?.action || 'change').toLowerCase()
   const entries = Array.isArray(params?.entries) ? params.entries : []
   if (entries.length === 0) return
+
+  // DEBUG: dump scoreboard 1 lần để hỗ trợ chẩn đoán money/shards = 0
+  if (!scoreboardDebugDumped && action !== 'remove') {
+    scoreboardDebugDumped = true
+    try {
+      const lines = entries.slice(0, 20).map((e, i) => {
+        const raw = e.custom_name || e.objective_name || ''
+        const clean = cleanScoreboardText(raw)
+        return `  #${i} score=${e.score} obj="${e.objective_name || ''}" name="${clean}"`
+      })
+      log(`[SCOREBOARD_DUMP] [ENTRIES:${entries.length}] [ACTION:${action}]\n${lines.join('\n')}`)
+    } catch (err) {
+      log(`[SCOREBOARD_DUMP] [ERR:${err.message}]`)
+    }
+  }
 
   for (let index = 0; index < entries.length; index += 1) {
     const scoreEntry = entries[index]
