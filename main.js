@@ -63,9 +63,9 @@ function extractLore(item) {
 function stripMcColorCodes(text) {
   if (typeof text !== 'string') return text
   return text
-    .replace(/Ã‚Â§[0-9a-fk-or]/gi, '')
-    .replace(/Â§[0-9a-fk-or]/gi, '')
-    .replace(/§[0-9a-fk-or]/gi, '')
+    .replace(/Ã‚Â§./gi, '')
+    .replace(/Â§./gi, '')
+    .replace(/§./gi, '')
 }
 
 function normalizeChat(text) {
