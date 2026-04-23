@@ -93,7 +93,9 @@ jobs:
         run: node afk-worker.js
 
       - name: Trigger chain (self-restart)
-        if: always() && inputs.chain == 'true'
+        # !cancelled() = chạy cả khi success/failure, NHƯNG skip khi user cancel run.
+        # Nhờ vậy bấm Cancel trên GitHub (hoặc Undeploy trong manager) sẽ dừng hẳn chain.
+        if: ${{ !cancelled() && inputs.chain == 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
