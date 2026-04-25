@@ -41,12 +41,23 @@ const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
 const AFK_DRIFT_DISTANCE = 24
 const AFK_REJOIN_COOLDOWN_MS = 12000
+const RTP_HUMANIZE_ENABLED = process.env.DISABLE_RTP_HUMANIZE !== '1'
+const RTP_HUMANIZE_MIN_MS = Math.max(60000, Number(process.env.RTP_HUMANIZE_MIN_MS || 30 * 60 * 1000))
+const RTP_HUMANIZE_MAX_MS = Math.max(RTP_HUMANIZE_MIN_MS, Number(process.env.RTP_HUMANIZE_MAX_MS || 60 * 60 * 1000))
+const RTP_HUMANIZE_COMMAND = process.env.RTP_HUMANIZE_COMMAND || '/rtp asia'
+const RTP_HUMANIZE_TELEPORT_WAIT_MS = Math.max(5000, Number(process.env.RTP_HUMANIZE_TELEPORT_WAIT_MS || 45000))
+const RTP_HUMANIZE_RETURN_DELAY_MS = Math.max(0, Number(process.env.RTP_HUMANIZE_RETURN_DELAY_MS || 5000))
+const RTP_HUMANIZE_MIN_DISTANCE = Math.max(8, Number(process.env.RTP_HUMANIZE_MIN_DISTANCE || 24))
+const RANDOM_RECONNECT_ENABLED = process.env.DISABLE_RANDOM_RECONNECT !== '1'
+const RANDOM_RECONNECT_MIN_MS = Math.max(5 * 60 * 1000, Number(process.env.RANDOM_RECONNECT_MIN_MS || 60 * 60 * 1000))
+const RANDOM_RECONNECT_MAX_MS = Math.max(RANDOM_RECONNECT_MIN_MS, Number(process.env.RANDOM_RECONNECT_MAX_MS || 120 * 60 * 1000))
 const DASHBOARD_REFRESH_MS = 60000
 const DASHBOARD_HOST = process.env.AFK_WEB_HOST || '127.0.0.1'
 const DASHBOARD_PORT = Number(process.env.AFK_WEB_PORT || 3020)
 const DASHBOARD_LOG_LIMIT = 240
 const AUTO_SPAWNER_ENABLED = process.env.AUTO_SPAWNER_ENABLED === 'true'
 const SPAWNER_SHARD_THRESHOLD = Number(process.env.SPAWNER_SHARD_THRESHOLD || 1500)
+const AUTO_SPAWNER_RETRY_COOLDOWN_MS = Math.max(30000, Number(process.env.AUTO_SPAWNER_RETRY_COOLDOWN_MS || 60000))
 const JAVA_MAIN_USERNAME = String(process.env.JAVA_MAIN_USERNAME || '').trim()
 const SPAWNER_HANDOFF_COOLDOWN_MS = Number(process.env.SPAWNER_HANDOFF_COOLDOWN_MS || 60000)
 function parseAreaList(raw) {
@@ -447,6 +458,14 @@ const state = {
   afkAnchorPosition: null,
   afkAnchorCapturedAt: null,
   lastRejoinAt: null,
+  rtpHumanizeTimer: null,
+  rtpHumanizeInProgress: false,
+  nextRtpHumanizeAt: null,
+  lastRtpHumanizeAt: null,
+  randomReconnectTimer: null,
+  randomReconnectInProgress: false,
+  nextRandomReconnectAt: null,
+  lastRandomReconnectAt: null,
   lastActivityAt: null,
   authInputInterval: null,
   authInputTick: 1n,
@@ -475,6 +494,7 @@ const state = {
     purchasedAt: null,
     droppedAt: null
   },
+  autoSpawnerPurchaseInFlight: false,
   // --- Manager task system -------------------------------------------------
   // activeTask: currently-executing task dispatched from manager via IPC.
   // deathSignal: flipped to true when the player dies (detected via packets)
@@ -615,6 +635,20 @@ function clearReconnectWatchdogTimeout() {
   if (state.reconnectWatchdogTimeout) {
     clearTimeout(state.reconnectWatchdogTimeout)
     state.reconnectWatchdogTimeout = null
+  }
+}
+
+function clearRtpHumanizeTimer() {
+  if (state.rtpHumanizeTimer) {
+    clearTimeout(state.rtpHumanizeTimer)
+    state.rtpHumanizeTimer = null
+  }
+}
+
+function clearRandomReconnectTimer() {
+  if (state.randomReconnectTimer) {
+    clearTimeout(state.randomReconnectTimer)
+    state.randomReconnectTimer = null
   }
 }
 
@@ -1407,6 +1441,151 @@ function positionDistance(a, b) {
   return Math.sqrt(dx * dx + dy * dy + dz * dz)
 }
 
+function randomInt(min, max) {
+  const lo = Math.ceil(Number(min))
+  const hi = Math.floor(Number(max))
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return lo
+  return lo + Math.floor(Math.random() * (hi - lo + 1))
+}
+
+function isSpawnerHandoffBusy() {
+  const phase = state.spawnerHandoff?.phase
+  return Boolean(phase && !['idle', 'cooldown', 'failed'].includes(phase))
+}
+
+function canRunRtpHumanize() {
+  return Boolean(
+    RTP_HUMANIZE_ENABLED &&
+    state.spawned &&
+    state.afkSuccess &&
+    state.client &&
+    !state.reconnecting &&
+    !state.shuttingDown &&
+    !state.afkAttemptInFlight &&
+    !state.activeTask &&
+    !state.rtpHumanizeInProgress &&
+    !isSpawnerHandoffBusy() &&
+    state.currentPosition
+  )
+}
+
+function canRunRandomReconnect() {
+  return Boolean(
+    RANDOM_RECONNECT_ENABLED &&
+    state.spawned &&
+    state.afkSuccess &&
+    state.client &&
+    !state.reconnecting &&
+    !state.shuttingDown &&
+    !state.afkAttemptInFlight &&
+    !state.activeTask &&
+    !state.rtpHumanizeInProgress &&
+    !state.randomReconnectInProgress &&
+    !isSpawnerHandoffBusy()
+  )
+}
+
+function scheduleNextRandomReconnect(reason = 'schedule') {
+  if (!RANDOM_RECONNECT_ENABLED || state.shuttingDown) return
+  clearRandomReconnectTimer()
+  const delay = randomInt(RANDOM_RECONNECT_MIN_MS, RANDOM_RECONNECT_MAX_MS)
+  state.nextRandomReconnectAt = new Date(Date.now() + delay).toISOString()
+  log(`[RANDOM_RECONNECT] [SCHEDULED] [IN:${Math.round(delay / 60000)}m] [REASON:${compactReason(reason, 32)}]`)
+  state.randomReconnectTimer = setTimeout(() => {
+    state.randomReconnectTimer = null
+    runRandomReconnectCycle()
+  }, delay)
+}
+
+function runRandomReconnectCycle() {
+  if (!canRunRandomReconnect()) {
+    log(`[RANDOM_RECONNECT] [SKIP] [READY:false] [AFK:${state.afkSuccess}] [TASK:${state.activeTask?.kind || 'none'}] [RTP:${state.rtpHumanizeInProgress ? 'yes' : 'no'}] [PHASE:${state.spawnerHandoff?.phase || 'idle'}]`)
+    scheduleNextRandomReconnect('not_ready')
+    return
+  }
+
+  state.randomReconnectInProgress = true
+  state.lastRandomReconnectAt = new Date().toISOString()
+  log(`[RANDOM_RECONNECT] [CLOSE] [AFK:${state.currentTargetArea ?? 'none'}] [POS:${formatPosition(state.currentPosition)}]`)
+  try {
+    state.client.close()
+  } catch (err) {
+    log(`[RANDOM_RECONNECT] [CLOSE_FAIL] [REASON:${compactReason(err?.message || err, 48)}]`)
+    state.randomReconnectInProgress = false
+  } finally {
+    scheduleNextRandomReconnect('cycle_done')
+  }
+}
+
+function scheduleNextRtpHumanize(reason = 'schedule') {
+  if (!RTP_HUMANIZE_ENABLED || state.shuttingDown) return
+  clearRtpHumanizeTimer()
+  const delay = randomInt(RTP_HUMANIZE_MIN_MS, RTP_HUMANIZE_MAX_MS)
+  state.nextRtpHumanizeAt = new Date(Date.now() + delay).toISOString()
+  log(`[RTP] [SCHEDULED] [IN:${Math.round(delay / 60000)}m] [REASON:${compactReason(reason, 32)}]`)
+  state.rtpHumanizeTimer = setTimeout(() => {
+    state.rtpHumanizeTimer = null
+    runRtpHumanizeCycle().catch(err => {
+      log(`[RTP] [ERR] ${compactReason(err?.message || err, 60)}`)
+      state.rtpHumanizeInProgress = false
+      scheduleNextRtpHumanize('error')
+    })
+  }, delay)
+}
+
+async function waitForRtpTeleport(origin) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < RTP_HUMANIZE_TELEPORT_WAIT_MS) {
+    if (state.shuttingDown || state.reconnecting || !state.client) return null
+    const distance = positionDistance(origin, state.currentPosition)
+    if (Number.isFinite(distance) && distance >= RTP_HUMANIZE_MIN_DISTANCE) {
+      return clonePosition(state.currentPosition)
+    }
+    await wait(1000)
+  }
+  return null
+}
+
+async function runRtpHumanizeCycle() {
+  if (!canRunRtpHumanize()) {
+    log(`[RTP] [SKIP] [READY:false] [AFK:${state.afkSuccess}] [TASK:${state.activeTask?.kind || 'none'}] [PHASE:${state.spawnerHandoff?.phase || 'idle'}]`)
+    scheduleNextRtpHumanize('not_ready')
+    return
+  }
+
+  state.rtpHumanizeInProgress = true
+  state.lastRtpHumanizeAt = new Date().toISOString()
+  const origin = clonePosition(state.currentPosition)
+  log(`[RTP] [COMMAND] ${RTP_HUMANIZE_COMMAND} [FROM:${formatPosition(origin)}]`)
+  helper.sendCommand(RTP_HUMANIZE_COMMAND)
+
+  try {
+    const teleportedTo = await waitForRtpTeleport(origin)
+    if (!teleportedTo) {
+      log(`[RTP] [TIMEOUT] [WAIT:${Math.floor(RTP_HUMANIZE_TELEPORT_WAIT_MS / 1000)}s] [POS:${formatPosition(state.currentPosition)}]`)
+      return
+    }
+
+    log(`[RTP] [TELEPORTED] [FROM:${formatPosition(origin)}] [TO:${formatPosition(teleportedTo)}]`)
+    await wait(RTP_HUMANIZE_RETURN_DELAY_MS)
+    if (state.shuttingDown || state.reconnecting || !state.client) return
+
+    clearAfkTimeout()
+    clearAnchorTimeout()
+    state.afkSuccess = false
+    state.afkAttemptInFlight = false
+    state.afkAnchorPosition = null
+    state.afkAnchorCapturedAt = null
+    state.lastStatusAt = new Date().toISOString()
+    state.lastRejoinAt = Date.now()
+    log(`[RTP] [RETURN_AFK] [DELAY:${Math.floor(RTP_HUMANIZE_RETURN_DELAY_MS / 1000)}s] [AFK:${state.currentTargetArea ?? 'none'}]`)
+    setTimeout(tryJoinCurrentArea, 500)
+  } finally {
+    state.rtpHumanizeInProgress = false
+    scheduleNextRtpHumanize('cycle_done')
+  }
+}
+
 async function buySkeletonSpawner() {
   setSpawnerPhase('open_shop')
   helper.sendCommand('/shop')
@@ -1488,6 +1667,63 @@ async function buySkeletonSpawner() {
   }
 
   state.spawnerHandoff.purchasedAt = new Date().toISOString()
+}
+
+function hasSkeletonSpawnerInInventory() {
+  return Boolean(helper.findInventoryItem(isSkeletonSpawnerSummary))
+}
+
+function canRetryAutoSpawnerPurchase() {
+  const lastRunAt = state.spawnerHandoff?.lastRunAt
+  if (!lastRunAt) return true
+  const lastRunMs = Date.parse(lastRunAt)
+  if (!Number.isFinite(lastRunMs)) return true
+  return Date.now() - lastRunMs >= AUTO_SPAWNER_RETRY_COOLDOWN_MS
+}
+
+function maybeStartAutoSpawnerPurchase(reason = 'scoreboard') {
+  const shardValue = state.lastShardValue
+  const hasPendingSpawner = hasSkeletonSpawnerInInventory()
+  const shouldStart = shouldStartSpawnerHandoff({
+    enabled: AUTO_SPAWNER_ENABLED,
+    afkSuccess: state.afkSuccess,
+    shardValue,
+    hasPendingSpawner,
+    threshold: SPAWNER_SHARD_THRESHOLD
+  })
+
+  if (!shouldStart) return
+  if (state.activeTask) return
+  if (state.autoSpawnerPurchaseInFlight) return
+  if (!canRetryAutoSpawnerPurchase()) return
+
+  state.autoSpawnerPurchaseInFlight = true
+  state.spawnerHandoff.lastRunAt = new Date().toISOString()
+  state.spawnerHandoff.lastError = null
+  log(`[SPAWNER] [AUTO_BUY] [START] [SHARDS:${shardValue}] [THRESHOLD:${SPAWNER_SHARD_THRESHOLD}] [REASON:${reason}]`)
+  scheduleDashboardBroadcast()
+
+  ;(async () => {
+    try {
+      await buySkeletonSpawner()
+      const deadline = Date.now() + 8000
+      let spawner = helper.findInventoryItem(isSkeletonSpawnerSummary)
+      while (Date.now() < deadline && !spawner) {
+        await wait(500)
+        spawner = helper.findInventoryItem(isSkeletonSpawnerSummary)
+      }
+      if (!spawner) throw new Error('Purchase did not produce skeleton spawner in inventory')
+      log(`[SPAWNER] [AUTO_BUY] [SUCCESS] [SLOT:${spawner.item.slot}]`)
+      setSpawnerPhase('cooldown')
+    } catch (err) {
+      const detail = String(err?.message || err)
+      log(`[SPAWNER] [AUTO_BUY] [FAILED] ${compactReason(detail, 60)}`)
+      setSpawnerPhase('failed', { lastError: detail })
+    } finally {
+      state.autoSpawnerPurchaseInFlight = false
+      scheduleDashboardBroadcast()
+    }
+  })()
 }
 
 async function tpaToJavaMain() {
@@ -1874,6 +2110,7 @@ function markAfkSuccess(reason) {
   log(`[AFK] [SUCCESS] [AFK:${state.currentTargetArea}] [REASON:${compactReason(reason, 36)}]`)
   captureAfkLookBase()
   startAuthInputLoop('afk_success')
+  maybeStartAutoSpawnerPurchase('afk_success')
   scheduleAnchorCapture('afk_success')
   helper.saveSnapshot('afk_success', {
     afk_state: {
@@ -1888,10 +2125,13 @@ function scheduleRejoin(reason, { immediate = false, allowAreaAdvance = false } 
   // Never rejoin while spawner handoff is active — the bot is intentionally
   // away from its AFK anchor (teleported to Java main). Rejoining now would
   // drag the bot off before it can drop the spawner.
-  const phase = state.spawnerHandoff?.phase
-  const handoffActive = phase && !['idle', 'cooldown', 'failed'].includes(phase)
-  if (handoffActive) {
-    log(`[AFK] [REJOIN_SKIP] handoff phase=${phase} reason=${compactReason(reason, 32)}`)
+  if (state.rtpHumanizeInProgress) {
+    log(`[AFK] [REJOIN_SKIP] rtp_humanize reason=${compactReason(reason, 32)}`)
+    return
+  }
+
+  if (isSpawnerHandoffBusy()) {
+    log(`[AFK] [REJOIN_SKIP] handoff phase=${state.spawnerHandoff?.phase} reason=${compactReason(reason, 32)}`)
     return
   }
 
@@ -2029,10 +2269,13 @@ function checkAfkPositionDrift(reason = 'interval') {
   // Skip drift check while spawner handoff is in progress — the TPA teleport
   // is INTENTIONAL movement and must not trigger an auto /afk rejoin that
   // would drag the bot away before the spawner is dropped.
-  const phase = state.spawnerHandoff?.phase
-  const handoffActive = phase && !['idle', 'cooldown', 'failed'].includes(phase)
-  if (handoffActive) {
-    log(`[AFK] [DRIFT_SKIP] handoff phase=${phase}`)
+  if (state.rtpHumanizeInProgress) {
+    log('[AFK] [DRIFT_SKIP] rtp_humanize')
+    return
+  }
+
+  if (isSpawnerHandoffBusy()) {
+    log(`[AFK] [DRIFT_SKIP] handoff phase=${state.spawnerHandoff?.phase}`)
     return
   }
 
@@ -2090,6 +2333,7 @@ function scheduleReconnect(reason) {
   state.reconnectAttempt += 1
   resetJoinState()
   state.reconnectWatchdogReason = null
+  state.randomReconnectInProgress = false
   state.client = null
   const reconnectDelay = alreadyLoggedIn
     ? ALREADY_LOGGED_IN_RECONNECT_DELAY_MS
@@ -2108,6 +2352,7 @@ function createAndWireClient() {
   clearReconnectWatchdogTimeout()
   state.reconnecting = false
   state.reconnectWatchdogReason = null
+  state.randomReconnectInProgress = false
 
   const hasProxy = Boolean(process.env.PROXY_HOST)
   const clientOptions = {
@@ -2356,15 +2601,14 @@ function createAndWireClient() {
     if (name === 'set_health' && Number(params?.health) <= 0) {
       if (state.activeTask?.phase === 'waiting_for_kill') signalDeath('set_health=0')
     }
-    if (name === 'respawn' && state.activeTask?.phase === 'waiting_for_kill') {
+  if (name === 'respawn' && state.activeTask?.phase === 'waiting_for_kill') {
       signalDeath(`respawn:${params?.state || 'unknown'}`)
     }
 
     if (name === 'set_score') {
       updateScoreboardEntries(params)
       refreshShardState()
-      // Auto-spawner trigger removed — spawner delivery is now manager-driven
-      // via IPC tasks (see runDeliverSpawnerTask).
+      maybeStartAutoSpawnerPurchase('scoreboard')
     }
 
     if (name === 'text') {
@@ -2467,6 +2711,9 @@ setInterval(() => {
   scheduleDashboardBroadcast()
 }, DASHBOARD_REFRESH_MS)
 
+scheduleNextRtpHumanize('startup')
+scheduleNextRandomReconnect('startup')
+
 process.on('SIGINT', () => {
   log('--- SIGINT ---')
   state.shuttingDown = true
@@ -2477,6 +2724,8 @@ process.on('SIGINT', () => {
   clearReconnectTimeout()
   clearReconnectWatchdogTimeout()
   clearAuthInputLoop()
+  clearRtpHumanizeTimer()
+  clearRandomReconnectTimer()
   helper.saveSnapshot('sigint', {
     afk_state: {
       area: state.currentTargetArea,
@@ -2522,6 +2771,8 @@ if (CLOUD_MODE) {
     state.shuttingDown = true
     stopLocalPlaytimeSession()
     clearAuthInputLoop()
+    clearRtpHumanizeTimer()
+    clearRandomReconnectTimer()
     try { state.client?.close() } catch {}
     await flushCloudQueue()
     setTimeout(() => process.exit(0), 1500)
@@ -2534,6 +2785,8 @@ process.on('SIGTERM', async () => {
   state.shuttingDown = true
   stopLocalPlaytimeSession()
   clearAuthInputLoop()
+  clearRtpHumanizeTimer()
+  clearRandomReconnectTimer()
   try { state.client?.close() } catch {}
   await flushCloudQueue()
   setTimeout(() => process.exit(0), 1500)
