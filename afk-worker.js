@@ -29,7 +29,7 @@ const ALREADY_LOGGED_IN_MAX_RETRIES = 3
 const AFK_ANTI_IDLE_MS = 45000
 const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 50))
 const AFK_AUTH_INPUT_LOG_EVERY = Math.max(1, Number(process.env.AFK_AUTH_INPUT_LOG_EVERY || 1200))
-const AFK_MOVEMENT_PACKET_MODE = String(process.env.AFK_MOVEMENT_PACKET_MODE || 'hybrid').toLowerCase()
+const AFK_MOVEMENT_PACKET_MODE = String(process.env.AFK_MOVEMENT_PACKET_MODE || 'auth').toLowerCase()
 const AFK_TICK_SYNC_EVERY = Math.max(1, Number(process.env.AFK_TICK_SYNC_EVERY || 10))
 const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
@@ -769,7 +769,7 @@ function sendTeleportAckIfNeeded() {
 }
 
 function sendAuthInputHeartbeat(reason = 'interval') {
-  if (!state.spawned || state.reconnecting || state.shuttingDown) return false
+  if (!state.spawned || !state.afkSuccess || state.reconnecting || state.shuttingDown) return false
   if (!state.client || state.client.entityId == null) return false
 
   const packet = buildAuthInputPacket()
@@ -790,7 +790,7 @@ function sendAuthInputHeartbeat(reason = 'interval') {
     state.lastActivityAt = new Date().toISOString()
 
     if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % AFK_AUTH_INPUT_LOG_EVERY === 0) {
-      log(`[AFK] [MOVE_HEARTBEAT] [COUNT:${state.authInputPacketCount}] [TICK:${state.authInputTick}] [MODE:${AFK_MOVEMENT_PACKET_MODE}] [AUTHORITY:${state.movementAuthority || 'unknown'}] [POS:${formatPosition(state.currentPosition)}] [REASON:${reason}]`)
+      log(`[AFK] [INPUT_HEARTBEAT] [COUNT:${state.authInputPacketCount}] [TICK:${state.authInputTick}] [MODE:${AFK_MOVEMENT_PACKET_MODE}] [AUTHORITY:${state.movementAuthority || 'unknown'}] [POS:${formatPosition(state.currentPosition)}] [REASON:${reason}]`)
     }
     return true
   } catch (err) {
@@ -1794,6 +1794,7 @@ function markAfkSuccess(reason) {
   state.successAt = new Date().toISOString()
   state.lastStatusAt = state.successAt
   log(`[AFK] [SUCCESS] [AFK:${state.currentTargetArea}] [REASON:${compactReason(reason, 36)}]`)
+  startAuthInputLoop('afk_success')
   scheduleAnchorCapture('afk_success')
   helper.saveSnapshot('afk_success', {
     afk_state: {
@@ -2194,7 +2195,6 @@ function createAndWireClient() {
         state.alreadyLoggedInRetries = 0
         startLocalPlaytimeSession()
         helper.sendInitializedOnce('player_spawn')
-        startAuthInputLoop('player_spawn')
         state.waitingForAutoAssign = true
         clearSpawnCommandTimeout()
         state.spawnCommandTimeout = setTimeout(() => {
